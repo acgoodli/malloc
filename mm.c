@@ -48,6 +48,9 @@ static const size_t DWORD_SIZE = 2 * WORD_SIZE;      /* doubleword size (bytes) 
 static const size_t CHUNKSIZE  = (1<<12);            /* initial heap size (bytes) */
 static const size_t OVERHEAD   = 2 * sizeof(size_t); /* overhead of header and footer (bytes) */
 
+/* You should only need ONE global variable */
+size_t* heap_listp; //Keeps track of the beginning of the linked list
+
 /* Helper Functions Given */
 
 static inline size_t max (size_t a, size_t b) {
@@ -128,8 +131,8 @@ static inline void* prevFreeBlock (void* ptr) {
 }
 
 static inline void make_free_node (void* curr, size_t size) {
-  void* prev = heap_listp;
-  void* next = nextFreeBlock (prev);
+  size_t* prev = heap_listp;
+  size_t* next = nextFreeBlock (prev);
   *header (curr) = packData (size, 0);
   *footer (curr) = packData (size, 0);
   *nextPtr (curr) = next;
@@ -145,17 +148,16 @@ static inline void mark_free_node (void* cursor) {
 }
 
 static inline void delete_free_node (void* cursor) {
-  void* prev = prevFreeBlock (cursor);
-  void* next = nextFreeBlock (cursor);
+  size_t* prev = prevFreeBlock (cursor);
+  size_t* next = nextFreeBlock (cursor);
   *nextPtr (prev) = next;
   *prevPtr (next) = prev;
 }
 
-/* You should only need ONE global variable */
-size_t* list_root; //Keeps track of the beginning of the linked list
-
 
 /* suggested function prototypes for internal helper routines */
+
+static void* find_fit (size_t asize);
 
 static void* coalesce (void* bp);
 
@@ -164,27 +166,48 @@ static void* coalesce (void* bp);
  */
 static void* extend_heap (size_t words)
 {
-  void* base = mem_sbrk (words * sizeof (size_t));
-  if (base == (void*)-1) {
-    return NULL;
-  }
-  make_free_node (base, words);
-  *header (nextBlock (base)) = packData (0, 1);
-  return coalesce (base);
+    /* Allocate an even number of words to maintain alignment */
+    /* Reminder: use mem_sbrk() to indicate amount to allocate */
+    /* Initialize free block header/footer and the epilogue header */
+	char* bp;
+	size_t size;
+
+	//Keep the number of words to even
+	size = (words % 2) ? (words + 1) * WORD_SIZE : words * WORD_SIZE;
+
+	//If there is not enough memory
+	if ((long)(bp = mem_sbrk(size)) == -1)
+		return NULL;
+
+	//Initialize the new block
+	PUT(header(bp), packData(size, 0)); // Free the header
+	PUT(footer(bp), packData(size, 0)); // Free the footer
+	PUT(header(nextBlock(bp)), packData(0, 1)); // New epilogue header
+
+	return coalesce(bp);
 }
 
 /* 
  * place block of asize bytes at start of free block bp 
  * split if remainder would be at least minimum block size
  */
-static inline void* place (void* cursor, size_t newSize) {
-  mark_free_node (cursor);
-  size_t splitSize = sizeOf (cursor) - newSize;
-  if (splitSize >= MIN_BLOCK_SIZE) {
-    setBlock (cursor, packData (newSize, 1));
-    make_free_node (nextBlock (cursor), splitSize);
-  }
-  return cursor;
+static void place (void *bp, size_t asize)
+{
+	size_t csize = SIZE_T_SIZE;
+
+	if ((csize - asize) >= (2 * DWORD_SIZE)) {
+		PUT(header(bp), packData(asize, 1));
+		PUT(footer(bp), packData(asize, 1));
+
+		//Split block if the remainder space can be its own block
+		bp = nextBlock(bp);
+		PUT(header(bp), packData((csize - asize), 0));
+		PUT(footer(bp), packData((csize - asize), 0));
+	}
+	else {
+		PUT(header(bp), packData(csize, 1));
+		PUT(footer(bp), packData(csize, 1));
+	}
 }
 
 
@@ -203,31 +226,21 @@ static inline void* place (void* cursor, size_t newSize) {
  */
 int mm_init (void) 
 {
-    /* create the initial empty heap
-       NOTE: it should only be 4 words initially (refer to the diagram)
-
-       hints:
-            - allocate with mem_sbrk
-            - initialize the four words to represent:
-                1. alignment padding
-                2. prologue header
-                3. prologue footer
-                4. epilogue header
-            - update the pointer to refer to the heap list pointer to immediately after the prologue
-            - extend empty heap to a free block of CHUNKSIZE bytes
-    */
 
     //If we do not have enough memory
-  size_t overhead = 4 * WORDSIZE;
-  size_t* base = (size_t*)mem_sbrk (overhead);
-  if (base == (size_t*)-1) {
-    return -1;
-  }
-  list_root = base + 2;
-  setBlock (list_root, packData (2, 1));
-  *header (nextBlock (list_root)) = packData (0, 1);
-  list_root = extend_heap (CHUNKSIZE);
-  return 0;
+	if ((heap_listp = mem_sbrk(4*WORD_SIZE)) == (void*)-1)
+		return -1;
+
+	PUT(heap_listp, 0); // Alignment Padding
+	PUT(heap_listp + (1*WORD_SIZE), packData(DWORD_SIZE, 1)); // Prologue Header
+	PUT(heap_listp + (4*WORD_SIZE), packData(DWORD_SIZE, 1)); // Prologue Footer
+	PUT(heap_listp + (5*WORD_SIZE), packData(DWORD_SIZE, 1)); // Epilogue
+	heap_listp += (2*WORD_SIZE);
+
+	if (extend_heap(CHUNKSIZE/WORD_SIZE) == NULL)
+		return -1;
+
+	return 0;
 }
 
 /* 
@@ -237,58 +250,109 @@ void *mm_malloc (size_t size)
 {
     /* Adjust block size to include overhead and alignment reqs. */
     /* Search the free list for a fit */
-    /* If no fit found: get more memory */
+	/* If no fit found: get more memory */
     /* place the block */
-  size_t newSize = align (size + OVERHEAD, ALIGNMENT) / WORDSIZE;
-  size_t* cursor = list_root;
-  for (; sizeOf (cursor) != 0; cursor = nextBlock (cursor)) {
-    if (sizeOf (cursor) >= newSize && !isAlloc (cursor)) {
-      return place (cursor, newSize);
+    size_t adjSize; // Adjusted block size
+    size_t extSize; // How far to extend the heap if no space
+    char* bp;
+
+    //If we need to allocate a size of 0
+    if (size == 0)
+    	return NULL;
+
+    //Adjusting block size to include block requirements
+    if (size <= DWORD_SIZE)
+    	adjSize = 2 * DWORD_SIZE;
+    else
+    	adjSize = DWORD_SIZE * ((size + DWORD_SIZE + (DWORD_SIZE - 1)) / DWORD_SIZE);
+
+    //Searching for a fit and placing the block there
+    if ((bp = find_fit(adjSize)) != NULL) {
+    	place(bp, adjSize);
+    	return bp;
     }
-  }
-  cursor = extend_heap (max (CHUNKSIZE, newSize));
-  return place (cursor, newSize);
+
+    //Extend the heap if no fit found
+    extSize = max(adjSize, CHUNKSIZE);
+    if ((bp = extend_heap(extSize / WORD_SIZE)) == NULL)
+    	return NULL;
+
+    place(bp, adjSize);
+    return bp;
 }
 
 /* 
  * mm_free - Free a block 
  */
-void mm_free(void *ptr)
+void mm_free (void *bp)
 {
-  make_free_node (ptr, sizeOf (ptr));
-  coalesce (ptr);
+    size_t data = packData (sizeOf (header (bp)), 0);
+    *header (bp) = data;
+    *footer (bp) = data;
+    coalesce (bp);
+}
+
+/* 
+ * find_fit - Find a fit for a block with asize bytes
+ * returns the pointer to that block
+ */
+static void* find_fit (size_t asize)
+{
+    for (char* bp = heap_listp; sizeOf (header (bp)) > 0; bp = nextBlock (bp)) {
+        if (!isAllocated (header (bp)) && (asize <= sizeOf (header (bp)))) {
+            return bp;
+        }
+    }
+    return NULL;
 }
 
 /*
  * coalesce - boundary tag coalescing. Return ptr to coalesced block
  */
-static size_t* coalesce (void* ptr) {
-  void* begin = ptr;
-  size_t size = sizeOf (ptr);
-  if (!isAlloc (prevBlock (ptr))) {
-    begin = prevBlock (ptr);
-    size += sizeOf (prevBlock (ptr));
-  }
-  if (!isAlloc (nextBlock (ptr))) {
-    size += sizeOf (nextBlock (ptr));
-  }
-  if (size != sizeOf (ptr)) {
-    make_free_node (begin, size);
-  }
-  return begin;
+static void* coalesce (void* bp) 
+{
+    size_t* prev = prevBlock (bp);
+    size_t* next = nextBlock (bp);
+    
+    int prev_free = !isAllocated (footer (prev));
+    int next_free = !isAllocated (header (next));
+
+    size_t* block_begin = bp;
+    size_t* block_end = bp;
+    size_t size = sizeOf (bp);
+    
+    if (prev_free) {
+        size += sizeOf (footer (prev));
+        block_begin = prev;
+    }
+    if (next_free) {
+        size += sizeOf (header (next));
+        block_end = next;
+    }
+    
+    size_t data = packData (size, 0);
+    *block_begin = data;
+    *block_end = data;
+    
+    return block_begin;
 }
 
 /*
  * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
  */
-void* mm_realloc (void *ptr, size_t size)
+void *mm_realloc(void *ptr, size_t size)
 {
-  void* newPtr = mm_malloc (size);
-  if (newPtr == NULL) {
-    return NULL;
-  }
-  size_t copySize = min (size, WORDSIZE * sizeOf (ptr) - OVERHEAD);
-  memcpy (newPtr, ptr, copySize);
-  mm_free (ptr);
-  return newPtr;
+    void *oldptr = ptr;
+    void *newptr;
+    size_t copySize;
+    
+    newptr = mm_malloc(size);
+    if (newptr == NULL)
+      return NULL;
+    copySize = *(size_t *)((char *)oldptr - SIZE_T_SIZE);
+    if (size < copySize)
+      copySize = size;
+    memcpy(newptr, oldptr, copySize);
+    mm_free(oldptr);
+    return newptr;
 }
