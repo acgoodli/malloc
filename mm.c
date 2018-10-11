@@ -38,9 +38,6 @@ team_t team = {
 /* single word (4) or double word (8) alignment */
 #define ALIGNMENT 8
 
-/* rounds up to the nearest multiple of ALIGNMENT */
-#define ALIGN(size) (((size) + (ALIGNMENT-1)) & ~0x7)
-
 
 #define SIZE_T_SIZE (ALIGN(sizeof(size_t)))
 
@@ -53,18 +50,16 @@ static const size_t OVERHEAD   = 2 * sizeof(size_t); /* overhead of header and f
 
 /* Helper Functions Given */
 
-/*
- * Returns the greater of the two sizes
- */
-static inline size_t max (size_t x, size_t y) {
-    return (x > y) ? x : y;
+static inline size_t max (size_t a, size_t b) {
+  return (a > b) ? a : b;
 }
 
-/*
- * Returns the lesser of the two sizes
- */
-static inline size_t min (size_t x, size_t y) {
-    return (x < y) ? x : y;
+static inline size_t min (size_t a, size_t b) {
+  return (a < b) ? a : b;
+}
+
+static inline size_t align (size_t size, size_t alignment) {
+  return (size + (alignment - 1)) & ~(alignment - 1);
 }
 
 /*
@@ -81,62 +76,86 @@ static inline size_t alignTo (size_t requested, size_t align) {
     return (align * (requested + align - 1)) / align;
 }
 
-/*
- * Sets the values of the data
- */
-static inline size_t packData (size_t size, size_t alloc) {
-    return size | alloc;
+static inline _Bool isAlloc (void* ptr) {
+  return *header(ptr) & 1;
 }
 
-/*
- * Returns the size of the bkock that p is pointing
- */
-static inline size_t sizeOf (size_t* p) {
-    return (*p) & -8;
+static inline size_t packData (size_t size, _Bool alloc) {
+  return size | (size_t)alloc;
 }
 
-/*
- * Determines if the pointer space has been allocated
- */
-static inline size_t isAllocated (size_t* p) {
-    return (*p) & 1;
+static inline void setBlock (void* ptr, size_t data) {
+  *header(ptr) = data;
+  *footer(ptr) = data;
 }
 
-/*
- * Returns the header of the allocated space
- */
-static inline size_t* header (void* p) {
-    return (size_t*)((char*)p - WORD_SIZE);
+static inline size_t* nextBlock (void* ptr) {
+  return (size_t*)ptr + sizeOf (ptr);
 }
 
-/*
- * Returns the footer of the allocated space
- */
-static inline size_t* footer (void* bp) {
-    return (size_t*)((char*)bp + sizeOf(header(bp) - DWORD_SIZE));
+static inline size_t* prevBlock (void* ptr) {
+  size_t* p = (size_t*)ptr;
+  size_t* size = p - 2;
+  return p - (*size & -2);
 }
 
-/*
- * Finds the next allocated block
- */
-static inline void* nextBlock (void* bp) {
-    return (void*)((char*)bp + sizeOf((size_t*)((char*)bp - WORD_SIZE)));
+static inline size_t* header (void* ptr) {
+  return ((size_t*)ptr) - 1;
 }
 
-/*
- * Finds the previous allocated block
- */
-static inline void* prevBlock (void* bp) {
-    return (void*)((char*)bp - sizeOf((size_t*)((char*)bp - DWORD_SIZE)));
+static inline size_t sizeOf (void* ptr) {
+  return *header(ptr) & -2;
+}
+
+static inline size_t* footer (void* ptr) {
+  return (size_t*)ptr + sizeOf (ptr) - 2;
+}
+
+static inline size_t** nextPtr (void* ptr) {
+  return (size_t**)ptr;
+}
+
+static inline size_t** prevPtr (void* ptr) {
+  return (size_t**)nextPtr(ptr) + 1;
+}
+
+static inline void* nextFreeBlock (void* ptr) {
+  return *nextPtr(ptr);
+}
+
+static inline void* prevFreeBlock (void* ptr) {
+  return *prevPtr(ptr);
+}
+
+static inline void make_free_node (void* curr, size_t size) {
+  void* prev = heap_listp;
+  void* next = nextFreeBlock (prev);
+  *header (curr) = packData (size, 0);
+  *footer (curr) = packData (size, 0);
+  *nextPtr (curr) = next;
+  *prevPtr (curr) = prev;
+  *nextPtr (prev) = curr;
+  *prevPtr (next) = curr;
+}
+
+static inline void mark_free_node (void* cursor) {
+  delete_free_node (cursor);
+  *header (cursor) ^= 1;
+  *footer (cursor) ^= 1;
+}
+
+static inline void delete_free_node (void* cursor) {
+  void* prev = prevFreeBlock (cursor);
+  void* next = nextFreeBlock (cursor);
+  *nextPtr (prev) = next;
+  *prevPtr (next) = prev;
 }
 
 /* You should only need ONE global variable */
-static char* heap_listp; //Keeps track of the beginning of the linked list
+size_t* list_root; //Keeps track of the beginning of the linked list
 
 
 /* suggested function prototypes for internal helper routines */
-
-static void* find_fit (size_t asize);
 
 static void* coalesce (void* bp);
 
@@ -145,53 +164,43 @@ static void* coalesce (void* bp);
  */
 static void* extend_heap (size_t words)
 {
-    /* Allocate an even number of words to maintain alignment */
-    /* Reminder: use mem_sbrk() to indicate amount to allocate */
-    /* Initialize free block header/footer and the epilogue header */
-    char* bp;
-    size_t size;
-
-    //Keep the number of words to even
-    size = (words % 2) ? (words + 1) * WORD_SIZE : words * WORD_SIZE;
-
-    //If there is not enough memory
-    if ((long)(bp = mem_sbrk(size)) == -1)
-        return NULL;
-
-    //Initialize the new block
-    PUT(header(bp), packData(size, 0)); // Free the header
-    PUT(header(bp), packData(size, 0)); // Free the footer
-    PUT(header(nextBlock(bp)), packData(0, 1)); // New epilogue header
-
-    return coalesce(bp);
+  void* base = mem_sbrk (words * sizeof (size_t));
+  if (base == (void*)-1) {
+    return NULL;
+  }
+  make_free_node (base, words);
+  *header (nextBlock (base)) = packData (0, 1);
+  return coalesce (base);
 }
 
 /* 
  * place block of asize bytes at start of free block bp 
  * split if remainder would be at least minimum block size
  */
-static void place (void *bp, size_t asize)
-{
-    size_t csize = SIZE_T_SIZE;
-
-    if ((csize - asize) >= (2 * DWORD_SIZE)) {
-        PUT(header(bp), packData(asize, 1));
-        PUT(footer(bp), packData(asize, 1));
-
-        //Split block if the remainder space can be its own block
-        bp = nextBlock(bp);
-        PUT(header(bp), packData((csize - asize), 0));
-        PUT(footer(bp), packData((csize - asize), 0));
-    }
-    else {
-        PUT(header(bp), packData(csize, 1));
-        PUT(footer(bp), packData(csize, 1));
-    }
+static inline void* place (void* cursor, size_t newSize) {
+  mark_free_node (cursor);
+  size_t splitSize = sizeOf (cursor) - newSize;
+  if (splitSize >= MIN_BLOCK_SIZE) {
+    setBlock (cursor, packData (newSize, 1));
+    make_free_node (nextBlock (cursor), splitSize);
+  }
+  return cursor;
 }
 
 
 /* required functions */
 
+/*
+ * mm_init - initialize the malloc package.
+ *
+ *   0   1   2   3   4   5   ...
+ * +---+---+---+---+---+---+---+---+---+---+
+ * |   | 4*|   |   | 4*| 0*|   |   |   |   |
+ * +---+---+---+---+---+---+---+---+---+---+
+ *     ^               ^ ^
+ *      \_____________/   \
+ *          prologue        epilogue
+ */
 int mm_init (void) 
 {
     /* create the initial empty heap
@@ -209,19 +218,16 @@ int mm_init (void)
     */
 
     //If we do not have enough memory
-    if ((heap_listp = mem_sbrk(4*WORD_SIZE)) == (void*)-1)
-        return -1;
-
-    PUT(heap_listp, 0); // Alignment Padding
-    PUT(heap_listp + (1*WORD_SIZE), packData(DWORD_SIZE, 1)); // Prologue Header
-    PUT(heap_listp + (2*WORD_SIZE), packData(DWORD_SIZE, 1)); // Prologue Footer
-    PUT(heap_listp + (3*WORD_SIZE), packData(DWORD_SIZE, 1)); // Epilogue
-    heap_listp += (2*WORD_SIZE);
-
-    if (extend_heap(CHUNKSIZE/WORD_SIZE) == NULL)
-        return -1;
-
-    return 0;
+  size_t overhead = 4 * WORDSIZE;
+  size_t* base = (size_t*)mem_sbrk (overhead);
+  if (base == (size_t*)-1) {
+    return -1;
+  }
+  list_root = base + 2;
+  setBlock (list_root, packData (2, 1));
+  *header (nextBlock (list_root)) = packData (0, 1);
+  list_root = extend_heap (CHUNKSIZE);
+  return 0;
 }
 
 /* 
@@ -233,107 +239,56 @@ void *mm_malloc (size_t size)
     /* Search the free list for a fit */
     /* If no fit found: get more memory */
     /* place the block */
-    size_t adjSize; // Adjusted block size
-    size_t extSize; // How far to extend the heap if no space
-    char* bp;
-
-    //If we need to allocate a size of 0
-    if (size == 0)
-        return NULL;
-
-    //Adjusting block size to include block requirements
-    if (size <= DWORD_SIZE)
-        adjSize = 2 * DWORD_SIZE;
-    else
-        adjSize = DWORD_SIZE * ((size + DWORD_SIZE + (DWORD_SIZE - 1)) / DWORD_SIZE);
-
-    //Searching for a fit and placing the block there
-    if ((bp = find_fit(adjSize)) != NULL) {
-        place(bp, adjSize);
-        return bp;
+  size_t newSize = align (size + OVERHEAD, ALIGNMENT) / WORDSIZE;
+  size_t* cursor = list_root;
+  for (; sizeOf (cursor) != 0; cursor = nextBlock (cursor)) {
+    if (sizeOf (cursor) >= newSize && !isAlloc (cursor)) {
+      return place (cursor, newSize);
     }
-
-    //Extend the heap if no fit found
-    extSize = max(adjSize, CHUNKSIZE);
-    if ((bp = extend_heap(extSize / WORD_SIZE)) == NULL)
-        return NULL;
-
-    place(bp, adjSize);
-    return bp;
+  }
+  cursor = extend_heap (max (CHUNKSIZE, newSize));
+  return place (cursor, newSize);
 }
 
 /* 
  * mm_free - Free a block 
  */
-void mm_free (void *bp)
+void mm_free(void *ptr)
 {
-    size_t data = packData (sizeOf (header (bp)), 0);
-    *header (bp) = data;
-    *footer (bp) = data;
-    coalesce (bp);
-}
-
-/* 
- * find_fit - Find a fit for a block with asize bytes
- * returns the pointer to that block
- */
-static void* find_fit (size_t asize)
-{
-    for (char* bp = heap_listp; sizeOf (header (bp)) > 0; bp = nextBlock (bp)) {
-        if (!isAllocated (header (bp)) && (asize <= sizeOf (header (bp)))) {
-            return bp;
-        }
-    }
-    return NULL;
+  make_free_node (ptr, sizeOf (ptr));
+  coalesce (ptr);
 }
 
 /*
  * coalesce - boundary tag coalescing. Return ptr to coalesced block
  */
-static void* coalesce (void* bp) 
-{
-    size_t* prev = prevBlock (bp);
-    size_t* next = nextBlock (bp);
-    
-    int prev_free = !isAllocated (footer (prev));
-    int next_free = !isAllocated (header (next));
-
-    size_t* block_begin = bp;
-    size_t* block_end = bp;
-    size_t size = sizeOf (bp);
-    
-    if (prev_free) {
-        size += sizeOf (footer (prev));
-        block_begin = prev;
-    }
-    if (next_free) {
-        size += sizeOf (header (next));
-        block_end = next;
-    }
-    
-    size_t data = packData (size, 0);
-    *block_begin = data;
-    *block_end = data;
-    
-    return block_begin;
+static size_t* coalesce (void* ptr) {
+  void* begin = ptr;
+  size_t size = sizeOf (ptr);
+  if (!isAlloc (prevBlock (ptr))) {
+    begin = prevBlock (ptr);
+    size += sizeOf (prevBlock (ptr));
+  }
+  if (!isAlloc (nextBlock (ptr))) {
+    size += sizeOf (nextBlock (ptr));
+  }
+  if (size != sizeOf (ptr)) {
+    make_free_node (begin, size);
+  }
+  return begin;
 }
 
 /*
  * mm_realloc - Implemented simply in terms of mm_malloc and mm_free
  */
-void *mm_realloc(void *ptr, size_t size)
+void* mm_realloc (void *ptr, size_t size)
 {
-    void *oldptr = ptr;
-    void *newptr;
-    size_t copySize;
-    
-    newptr = mm_malloc(size);
-    if (newptr == NULL)å
-      return NULL;
-    copySize = *(size_t *)((char *)oldptr - SIZE_T_SIZE);
-    if (size < copySize)
-      copySize = size;
-    memcpy(newptr, oldptr, copySize);
-    mm_free(oldptr);
-    return newptr;
+  void* newPtr = mm_malloc (size);
+  if (newPtr == NULL) {
+    return NULL;
+  }
+  size_t copySize = min (size, WORDSIZE * sizeOf (ptr) - OVERHEAD);
+  memcpy (newPtr, ptr, copySize);
+  mm_free (ptr);
+  return newPtr;
 }
