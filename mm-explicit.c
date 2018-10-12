@@ -138,7 +138,7 @@ static inline size_t align (size_t size, size_t alignment) {
 int mm_init(void)
 {
   //If we do not have enough memory
-	if ((heap_listp = mem_sbrk(*WORD_SIZE)) == (void*)-1)
+	if ((heap_listp = mem_sbrk(5*WORD_SIZE)) == (void*)-1)
 		return -1;
 
 	PUT(heap_listp, 0); // Alignment Padding
