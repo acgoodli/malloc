@@ -137,7 +137,22 @@ static inline size_t align (size_t size, size_t alignment) {
  */
 int mm_init(void)
 {
+  //If we do not have enough memory
+	if ((heap_listp = mem_sbrk(*WORD_SIZE)) == (void*)-1)
+		return -1;
 
+	PUT(heap_listp, 0); // Alignment Padding
+	PUT(heap_listp + (1*WORD_SIZE), packData(DWORD_SIZE, 1)); // Prologue Header
+	PUT(heap_listp + (4*WORD_SIZE), 0); //place previous pointer
+	PUT(heap_listp + (5*WORD_SIZE), 0); //place next pointer
+	PUT(heap_listp + (4*WORD_SIZE), packData(DWORD_SIZE, 1)); // Prologue Footer
+	PUT(heap_listp + (5*WORD_SIZE), packData(DWORD_SIZE, 1)); // Epilogue
+	heap_listp += (2*WORD_SIZE);
+
+	if (extend_heap(CHUNKSIZE/WORD_SIZE) == NULL)
+		return -1;
+
+	return 0;
 }
 
 void mm_free(void *ptr)
